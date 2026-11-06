@@ -98,6 +98,92 @@ create table if not exists kaleido.answers (
 );
 create index if not exists answers_question on kaleido.answers (question_id);
 
+-- ---------- блоки по программе (с ноября 2026) ----------
+-- Блок — доклад или выход ведущего. Открывается сам по времени из программы (starts_at)
+-- или раньше — кнопкой администратора (opened_at). Открытый блок не закрывается.
+create table if not exists kaleido.blocks (
+  id          text primary key,
+  position    int,
+  kind        text not null check (kind in ('host', 'talk')),
+  title       text not null,
+  speaker     text,
+  icon        text,
+  time_text   text,                       -- «10:09–10:29», как в программе
+  starts_at   timestamptz,
+  ends_at     timestamptz,
+  opened_at   timestamptz,                -- открыт вручную
+  active      boolean not null default true,
+  updated_at  timestamptz not null default now()
+);
+
+alter table kaleido.players add column if not exists is_admin boolean not null default false;
+
+-- Задания: блок (или 'extras' — «Как ещё заработать баллы»), данные для показа и решение.
+alter table kaleido.questions add column if not exists block_id text;
+alter table kaleido.questions add column if not exists data jsonb;       -- видит участник: emoji, hint, left/right, puzzle, picture
+alter table kaleido.questions add column if not exists solution jsonb;   -- не уходит в браузер: multi, match, code
+alter table kaleido.questions drop constraint if exists questions_kind_check;
+alter table kaleido.questions add constraint questions_kind_check
+  check (kind in ('choice', 'open', 'multi', 'match', 'code', 'sudoku', 'paint'));
+alter table kaleido.questions drop constraint if exists questions_choice_valid;
+alter table kaleido.questions add constraint questions_choice_valid
+  check (kind <> 'choice' or (options is not null and correct_option is not null));
+
+alter table kaleido.answers add column if not exists answer_data jsonb;  -- выбранные варианты, пары, сетка
+
+-- Неверные попытки кодового слова (ответ засчитывается после последней).
+create table if not exists kaleido.attempts (
+  game_id      uuid not null references kaleido.games (id) on delete cascade,
+  question_id  text not null,
+  wrong        int not null default 0,
+  primary key (game_id, question_id)
+);
+
+-- ---------- номер участника (с ноября 2026) ----------
+-- Каждому участнику — свой номер: по нему видно баллы и объявляют победителей розыгрышей.
+create sequence if not exists kaleido.player_number_seq;
+alter table kaleido.players add column if not exists number int;
+update kaleido.players p set number = s.n
+  from (select id, coalesce((select max(number) from kaleido.players), 0) + row_number() over (order by created_at, id) as n
+        from kaleido.players where number is null) s
+  where p.id = s.id;
+select setval('kaleido.player_number_seq', coalesce((select max(number) from kaleido.players), 0) + 1, false);
+alter table kaleido.players alter column number set default nextval('kaleido.player_number_seq');
+create unique index if not exists players_number on kaleido.players (number);
+
+-- ---------- билеты и розыгрыши ----------
+-- Баллы тратятся на билеты. Билет участвует в ближайшем розыгрыше; в одном розыгрыше
+-- участник выигрывает не больше одного приза (остальные его билеты в этом розыгрыше сгорают).
+create table if not exists kaleido.draws (
+  id          serial primary key,
+  title       text not null,
+  prizes      int not null check (prizes between 1 and 1000),
+  tickets     int not null default 0,       -- сколько билетов участвовало
+  players     int not null default 0,       -- сколько участников
+  created_by  uuid references kaleido.players (id),
+  created_at  timestamptz not null default now()
+);
+create table if not exists kaleido.tickets (
+  id          bigserial primary key,
+  player_id   uuid not null references kaleido.players (id) on delete cascade,
+  price       int not null,
+  draw_id     int references kaleido.draws (id),   -- пусто — ждёт ближайшего розыгрыша
+  won         boolean not null default false,
+  created_at  timestamptz not null default now()
+);
+create index if not exists tickets_player on kaleido.tickets (player_id);
+create index if not exists tickets_pending on kaleido.tickets (draw_id) where draw_id is null;
+
+insert into kaleido.config (key, value) values
+  ('ticket_price', '30'),             -- цена билета в баллах
+  ('tickets_per_buy', '20'),          -- сколько билетов можно купить за раз
+  ('live_mode', 'auto'),              -- auto: «сейчас идёт» по времени программы; manual: выбирает администратор
+  ('live_block', ''),                 -- в ручном режиме: id идущего блока, пусто — перерыв
+  ('game_admins', '987445087'),       -- user_id Telegram администраторов игры через запятую
+  ('poll_seconds', '45'),             -- как часто игра спрашивает, не открылся ли блок
+  ('code_attempts', '3')              -- сколько раз можно ввести кодовое слово
+on conflict (key) do nothing;
+
 select jsonb_build_object('ok', true, 'step', '001_schema') as result;
 
 -- ===== 002_api =====
@@ -173,7 +259,7 @@ begin
   values (kaleido.sha(v_token), p_player, now() + make_interval(days => kaleido.cfg('session_days', '60')::int));
   update kaleido.players set last_seen_at = now() where id = p_player returning * into p;
   return jsonb_build_object('token', v_token, 'player',
-    jsonb_build_object('id', p.id, 'provider', p.provider, 'name', p.name, 'is_test', p.is_test));
+    jsonb_build_object('id', p.id, 'number', p.number, 'provider', p.provider, 'name', p.name, 'is_test', p.is_test));
 end $$;
 
 -- Создать участника с кодом приглашения (организаторы, через консоль n8n):
@@ -185,34 +271,155 @@ returns uuid language sql as $$
   returning id
 $$;
 
+create or replace function kaleido.set_cfg(k text, v text) returns void
+language sql as $$ insert into kaleido.config (key, value) values (k, v) on conflict (key) do update set value = excluded.value $$;
+
+-- Блок открыт: вручную администратором или наступило время по программе. Открытый блок не закрывается.
+create or replace function kaleido.block_is_open(bl kaleido.blocks) returns boolean
+language sql stable as $$ select bl.opened_at is not null or (bl.starts_at is not null and now() >= bl.starts_at) $$;
+
+-- Какой блок идёт сейчас (null — перерыв). Пока идёт выступление, дополнительные задания закрыты.
+create or replace function kaleido.live_block() returns text
+language sql stable as $$
+  select case when kaleido.cfg('live_mode', 'auto') = 'manual'
+    then (select bl.id from kaleido.blocks bl where bl.active and bl.id = kaleido.cfg('live_block'))
+    else (select bl.id from kaleido.blocks bl where bl.active and bl.starts_at <= now() and now() < bl.ends_at
+          order by bl.starts_at desc limit 1) end
+$$;
+
+create or replace function kaleido.is_admin(p kaleido.players) returns boolean
+language sql stable as $$
+  select p.is_admin or (p.provider = 'telegram'
+    and p.external_id = any (string_to_array(replace(kaleido.cfg('game_admins'), ' ', ''), ',')))
+$$;
+
+create or replace function kaleido.main_total() returns int
+language sql stable as $$
+  select count(*)::int from kaleido.questions where active and block_id is not null and block_id <> 'extras'
+$$;
+
+-- Кодовое слово: регистр, ё/е, пробелы и знаки препинания не важны.
+create or replace function kaleido.norm_code(t text) returns text
+language sql immutable as $$
+  select regexp_replace(replace(kaleido.lower_ru(coalesce(t, '')), 'ё', 'е'), '[^a-zа-я0-9]', '', 'g')
+$$;
+
+-- Судоку решено: 81 цифра 1–9, подсказки на месте, в каждой строке, столбце и квадрате 3×3 все девять цифр.
+create or replace function kaleido.sudoku_ok(grid text, givens text) returns boolean
+language sql immutable as $$
+  select coalesce(grid ~ '^[1-9]{81}$', false)
+    and not exists (select 1 from generate_series(1, 81) i
+                    where substr(givens, i, 1) <> '0' and substr(givens, i, 1) <> substr(grid, i, 1))
+    and not exists (
+      select 1 from generate_series(0, 80) i
+      cross join lateral (values ('r' || (i / 9)), ('c' || (i % 9)), ('b' || ((i / 27) * 3 + (i % 9) / 3))) as gr(k)
+      group by gr.k having count(distinct substr(grid, i + 1, 1)) <> 9)
+$$;
+
+-- Задание для браузера: без правильных ответов.
+create or replace function kaleido.task_public(q kaleido.questions) returns jsonb
+language sql stable as $$
+  select jsonb_strip_nulls(jsonb_build_object(
+    'id', q.id, 'block', q.block_id, 'kind', q.kind, 'topic', q.topic, 'prompt', q.prompt, 'points', q.points,
+    'options', case when q.kind in ('choice', 'multi') then q.options end,
+    'pick', case when q.kind = 'multi' then jsonb_array_length(q.solution) end,
+    'emoji', q.data->>'emoji', 'hint', q.data->>'hint',
+    'left', q.data->'left', 'right', q.data->'right',
+    'grid', q.data#>>'{puzzle,grid}', 'picture', q.data->'picture'))
+$$;
+
+-- Баллы участника — счёт текущей партии. Потраченное на билеты не возвращается и при новой партии:
+-- переигрыванием баллы на билеты не накопить.
+create or replace function kaleido.player_score(p_player uuid) returns int
+language sql stable as $$
+  select coalesce((select score from kaleido.games where player_id = p_player and status in ('active', 'finished')
+    order by (status = 'active') desc, created_at desc limit 1), 0)
+$$;
+
+create or replace function kaleido.player_spent(p_player uuid) returns int
+language sql stable as $$ select coalesce(sum(price), 0)::int from kaleido.tickets where player_id = p_player $$;
+
+-- Кошелёк для участника: номер, баллы, билеты, последние розыгрыши (победители — только номера).
+create or replace function kaleido.wallet(p kaleido.players) returns jsonb
+language sql stable as $$
+  select jsonb_build_object(
+    'number', p.number, 'score', s.sc, 'spent', s.sp, 'balance', greatest(0, s.sc - s.sp),
+    'price', kaleido.cfg('ticket_price', '30')::int, 'perBuy', kaleido.cfg('tickets_per_buy', '20')::int,
+    'pending', (select count(*) from kaleido.tickets where player_id = p.id and draw_id is null),
+    'draws', (select coalesce(jsonb_agg(jsonb_build_object(
+        'id', d.id, 'title', d.title, 'prizes', d.prizes, 'at', extract(epoch from d.created_at)::bigint,
+        'winners', (select coalesce(jsonb_agg(pl.number order by pl.number), '[]'::jsonb)
+                    from kaleido.tickets t join kaleido.players pl on pl.id = t.player_id where t.draw_id = d.id and t.won),
+        'mine', (select count(*) from kaleido.tickets t where t.draw_id = d.id and t.player_id = p.id),
+        'won', exists (select 1 from kaleido.tickets t where t.draw_id = d.id and t.player_id = p.id and t.won))
+        order by d.id desc), '[]'::jsonb)
+      from (select * from kaleido.draws order by id desc limit 10) d))
+  from (select kaleido.player_score(p.id) as sc, kaleido.player_spent(p.id) as sp) s
+$$;
+
+-- Итог розыгрыша для организаторов: с именами победителей.
+create or replace function kaleido.draw_admin(p_draw int) returns jsonb
+language sql stable as $$
+  select jsonb_build_object('id', d.id, 'title', d.title, 'prizes', d.prizes, 'tickets', d.tickets, 'players', d.players,
+    'at', extract(epoch from d.created_at)::bigint,
+    'winners', (select coalesce(jsonb_agg(jsonb_build_object('number', pl.number, 'name', pl.name) order by pl.number), '[]'::jsonb)
+                from kaleido.tickets t join kaleido.players pl on pl.id = t.player_id where t.draw_id = d.id and t.won))
+  from kaleido.draws d where d.id = p_draw
+$$;
+
+-- Что открыто и что идёт сейчас. Лёгкий ответ: игра спрашивает его раз в poll секунд.
+create or replace function kaleido.state_payload() returns jsonb
+language sql stable as $$
+  select jsonb_build_object(
+    'now', extract(epoch from now())::bigint,
+    'live', kaleido.live_block(),
+    'liveMode', kaleido.cfg('live_mode', 'auto'),
+    'extrasOpen', kaleido.live_block() is null,
+    'poll', kaleido.cfg('poll_seconds', '45')::int,
+    'lastDraw', (select max(id) from kaleido.draws),
+    'open', (select coalesce(jsonb_agg(bl.id order by bl.position), '[]'::jsonb)
+             from kaleido.blocks bl where bl.active and kaleido.block_is_open(bl)))
+$$;
+
 create or replace function kaleido.create_game(p_player uuid) returns kaleido.games
 language plpgsql as $$
 declare v_ids jsonb; g kaleido.games;
 begin
-  select coalesce(jsonb_agg(id order by position), '[]'::jsonb) into v_ids from kaleido.questions where active;
-  if jsonb_array_length(v_ids) = 0 then raise exception 'В базе нет вопросов: выполните 003_questions'; end if;
+  select coalesce(jsonb_agg(id order by position), '[]'::jsonb) into v_ids from kaleido.questions where active and block_id is not null;
+  if jsonb_array_length(v_ids) = 0 then raise exception 'В базе нет заданий: выполните 003_questions'; end if;
   insert into kaleido.games (player_id, seed, question_ids, total)
-  values (p_player, 1 + floor(random() * 2147483646)::bigint, v_ids, jsonb_array_length(v_ids))
+  values (p_player, 1 + floor(random() * 2147483646)::bigint, v_ids, kaleido.main_total())
   returning * into g;
   return g;
 end $$;
 
 -- Состояние партии для фронтенда. Правильные ответы сюда не попадают.
-create or replace function kaleido.game_payload(g kaleido.games) returns jsonb
+drop function if exists kaleido.game_payload(kaleido.games);
+create or replace function kaleido.game_payload(g kaleido.games, p kaleido.players) returns jsonb
 language sql stable as $$
-  select jsonb_build_object(
+  select kaleido.state_payload() || jsonb_build_object(
     'game', jsonb_build_object('id', g.id, 'seed', g.seed, 'status', g.status, 'score', g.score,
-      'correct', g.correct, 'answered', g.answered, 'total', g.total),
-    'questions', (
-      select coalesce(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
-        'id', q.id, 'kind', q.kind, 'topic', q.topic, 'prompt', q.prompt,
-        'options', case when q.kind = 'choice' then q.options end, 'points', q.points)) order by x.ord), '[]'::jsonb)
-      from jsonb_array_elements_text(g.question_ids) with ordinality as x(qid, ord)
-      join kaleido.questions q on q.id = x.qid),
-    'answers', (
-      select coalesce(jsonb_agg(jsonb_build_object('position', a.position, 'kind', a.kind,
+      'correct', g.correct, 'answered', g.answered, 'total', kaleido.main_total()),
+    'blocks', (select coalesce(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
+        'id', bl.id, 'kind', bl.kind, 'title', bl.title, 'speaker', bl.speaker, 'icon', bl.icon, 'time', bl.time_text,
+        'startsAt', extract(epoch from bl.starts_at)::bigint, 'endsAt', extract(epoch from bl.ends_at)::bigint,
+        'count', (select count(*) from kaleido.questions q where q.active and q.block_id = bl.id),
+        -- задания закрытого блока не отдаём: по вариантам ответа можно было бы подсмотреть заранее
+        'tasks', case when kaleido.block_is_open(bl) then (select coalesce(jsonb_agg(q.id order by q.position), '[]'::jsonb)
+                  from kaleido.questions q where q.active and q.block_id = bl.id) end)) order by bl.position), '[]'::jsonb)
+      from kaleido.blocks bl where bl.active),
+    'extras', jsonb_build_object('title', kaleido.cfg('extras_title', 'Как ещё заработать баллы'),
+      'tasks', (select coalesce(jsonb_agg(q.id order by q.position), '[]'::jsonb)
+                from kaleido.questions q where q.active and q.block_id = 'extras')),
+    'tasks', (select coalesce(jsonb_agg(kaleido.task_public(q) order by q.position), '[]'::jsonb)
+              from kaleido.questions q left join kaleido.blocks bl on bl.id = q.block_id
+              where q.active and (q.block_id = 'extras' or (bl.active and kaleido.block_is_open(bl)))),
+    'answers', (select coalesce(jsonb_agg(jsonb_build_object('id', a.question_id, 'position', a.position, 'kind', a.kind,
         'isCorrect', a.is_correct, 'points', a.points) order by a.position), '[]'::jsonb)
       from kaleido.answers a where a.game_id = g.id),
+    'isAdmin', kaleido.is_admin(p),
+    'me', jsonb_build_object('number', p.number, 'name', p.name),
+    'wallet', kaleido.wallet(p),
     'allowReplay', kaleido.cfg('replay_allowed', 'true') = 'true')
 $$;
 
@@ -223,13 +430,15 @@ declare
   p kaleido.players;
   g kaleido.games;
   q kaleido.questions;
+  bl kaleido.blocks;
   v_hash text; v_calc text; v_secret text; v_user jsonb; v_name text;
-  v_expected text; v_ok boolean; v_points int; v_text text; v_len int; v_opt int;
-  v_answered int; v_finished boolean;
+  v_ok boolean; v_points int; v_text text; v_len int; v_opt int; v_data jsonb;
+  v_sel int[]; v_sol int[]; v_n int; v_k int; v_main int; v_total int; v_block text;
+  v_price int; v_sp int; v_draw int; v_title text; v_prizes int;
 begin
   -- ---------- без входа ----------
   if act = 'health' then
-    return jsonb_build_object('ok', true, 'questions', (select count(*) from kaleido.questions where active));
+    return jsonb_build_object('ok', true, 'questions', (select count(*) from kaleido.questions where active and block_id is not null));
   end if;
 
   if act = 'config' then
@@ -239,6 +448,9 @@ begin
       'telegramKeyId', case when kaleido.cfg('telegram_webapp_secret') <> ''
         then left(encode(sha256(convert_to(kaleido.cfg('telegram_webapp_secret'), 'UTF8')), 'hex'), 8) end);
   end if;
+
+  -- что открыто сейчас — игра спрашивает раз в poll секунд, вход не нужен
+  if act = 'state' then return kaleido.state_payload(); end if;
 
   if act = 'auth_guest' then
     if kaleido.cfg('guest_allowed', 'true') <> 'true' then
@@ -289,7 +501,8 @@ begin
   if not found then return kaleido.err('AUTH_REQUIRED', 'Нужно войти заново'); end if;
 
   if act = 'me' then
-    return jsonb_build_object('player', jsonb_build_object('id', p.id, 'provider', p.provider, 'name', p.name, 'is_test', p.is_test));
+    return jsonb_build_object('player', jsonb_build_object('id', p.id, 'number', p.number, 'provider', p.provider, 'name', p.name,
+      'is_test', p.is_test, 'is_admin', kaleido.is_admin(p)));
   end if;
 
   if act = 'game' then
@@ -302,7 +515,7 @@ begin
         select * into g from kaleido.games where player_id = p.id and status = 'active';
       end;
     end if;
-    return kaleido.game_payload(g);
+    return kaleido.game_payload(g, p);
   end if;
 
   if act = 'new_game' then
@@ -312,18 +525,49 @@ begin
     end if;
     update kaleido.games set status = 'abandoned' where player_id = p.id and status = 'active';
     g := kaleido.create_game(p.id);
-    return kaleido.game_payload(g);
+    return kaleido.game_payload(g, p);
   end if;
 
+  -- ---------- билеты ----------
+  if act = 'wallet' then return kaleido.wallet(p); end if;
+
+  if act = 'buy_tickets' then
+    perform 1 from kaleido.players where id = p.id for update;     -- покупки одного участника — по очереди
+    v_k := kaleido.cfg('tickets_per_buy', '20')::int;
+    if coalesce(jsonb_typeof(b->'count'), '') <> 'number' or (b->>'count') !~ '^\d{1,4}$'
+       or (b->>'count')::int < 1 or (b->>'count')::int > v_k then
+      return kaleido.err('BAD_COUNT', format('За раз можно купить от 1 до %s билетов', v_k));
+    end if;
+    v_n := (b->>'count')::int;
+    v_price := kaleido.cfg('ticket_price', '30')::int;
+    v_main := kaleido.player_score(p.id); v_sp := kaleido.player_spent(p.id);
+    if v_n * v_price > v_main - v_sp then
+      return kaleido.err('NOT_ENOUGH', format('Не хватает баллов: нужно %s, доступно %s', v_n * v_price, greatest(0, v_main - v_sp)));
+    end if;
+    insert into kaleido.tickets (player_id, price) select p.id, v_price from generate_series(1, v_n);
+    return kaleido.wallet(p) || jsonb_build_object('bought', v_n);
+  end if;
+
+  -- ---------- ответ на задание ----------
+  -- Задания отвечаются в любом порядке, но только в открытых блоках.
+  -- Дополнительные (block_id = 'extras') — только в перерывах между выступлениями.
   if act = 'answer' then
     select * into g from kaleido.games where id::text = coalesce(b->>'game_id', '') and player_id = p.id for update;
     if not found then return kaleido.err('GAME_NOT_FOUND', 'Партия не найдена'); end if;
-    if g.status <> 'active' then return kaleido.err('GAME_FINISHED', 'Партия уже завершена'); end if;
-    v_expected := g.question_ids->>g.answered;
-    if v_expected is distinct from b->>'question_id' then
-      return kaleido.err('OUT_OF_ORDER', 'Игра открыта в другом окне — обновляю');
+    if g.status = 'abandoned' then return kaleido.err('GAME_FINISHED', 'Эта партия закрыта — обновляю'); end if;
+    select * into q from kaleido.questions where id = coalesce(b->>'question_id', '') and active and block_id is not null;
+    if not found then return kaleido.err('TASK_NOT_FOUND', 'Задание обновилось — загружаю заново'); end if;
+    if exists (select 1 from kaleido.answers where game_id = g.id and question_id = q.id) then
+      return kaleido.err('ALREADY_ANSWERED', 'Ответ уже принят');
     end if;
-    select * into q from kaleido.questions where id = v_expected;
+    if q.block_id = 'extras' then
+      if kaleido.live_block() is not null then
+        return kaleido.err('EXTRAS_CLOSED', 'Сейчас идёт выступление — дополнительные задания откроются в перерыве');
+      end if;
+    else
+      select * into bl from kaleido.blocks where id = q.block_id and active;
+      if not found or not kaleido.block_is_open(bl) then return kaleido.err('BLOCK_CLOSED', 'Этот блок ещё не открылся'); end if;
+    end if;
 
     if q.kind = 'choice' then
       if coalesce(jsonb_typeof(b->'option_index'), '') <> 'number' then return kaleido.err('BAD_OPTION', 'Выбери вариант ответа'); end if;
@@ -331,7 +575,62 @@ begin
       if v_opt < 0 or v_opt >= jsonb_array_length(q.options) then return kaleido.err('BAD_OPTION', 'Выбери вариант ответа'); end if;
       v_ok := v_opt = q.correct_option;
       v_points := case when v_ok then q.points else 0 end;
-    else
+
+    elsif q.kind = 'multi' then
+      if coalesce(jsonb_typeof(b->'options'), '') <> 'array' or jsonb_array_length(b->'options') = 0
+         or exists (select 1 from jsonb_array_elements(b->'options') x
+                    where jsonb_typeof(x) <> 'number' or (x#>>'{}') !~ '^\d+$'
+                       or (x#>>'{}')::int >= jsonb_array_length(q.options)) then
+        return kaleido.err('BAD_OPTION', 'Отметь хотя бы один вариант');
+      end if;
+      select array_agg(distinct (x#>>'{}')::int order by (x#>>'{}')::int) into v_sel from jsonb_array_elements(b->'options') x;
+      select array_agg(x::int order by x::int) into v_sol from jsonb_array_elements_text(q.solution) x;
+      v_ok := v_sel = v_sol;
+      v_points := case when v_ok then q.points else 0 end;
+      v_data := to_jsonb(v_sel);
+
+    elsif q.kind = 'match' then
+      v_n := jsonb_array_length(q.solution);
+      if coalesce(jsonb_typeof(b->'match'), '') <> 'array' or jsonb_array_length(b->'match') <> v_n
+         or exists (select 1 from jsonb_array_elements(b->'match') x where jsonb_typeof(x) <> 'number') then
+        return kaleido.err('BAD_OPTION', 'Сопоставь все пары');
+      end if;
+      select count(*) into v_k from generate_series(0, v_n - 1) i where (b->'match'->>i) = (q.solution->>i);
+      v_ok := v_k = v_n;
+      v_points := round(q.points * v_k::numeric / v_n)::int;     -- за каждую верную пару — своя доля
+      v_data := b->'match';
+
+    elsif q.kind = 'code' then
+      v_text := btrim(coalesce(b->>'text', ''));
+      if v_text = '' then return kaleido.err('EMPTY_TEXT', 'Впиши слово'); end if;
+      if length(v_text) > 200 then return kaleido.err('TOO_LONG', 'Слишком длинно: до 200 символов'); end if;
+      v_ok := exists (select 1 from jsonb_array_elements_text(q.solution) x
+                      where kaleido.norm_code(x) <> '' and kaleido.norm_code(x) = kaleido.norm_code(v_text));
+      if not v_ok then
+        insert into kaleido.attempts (game_id, question_id, wrong) values (g.id, q.id, 1)
+          on conflict (game_id, question_id) do update set wrong = kaleido.attempts.wrong + 1
+          returning wrong into v_k;
+        if v_k < kaleido.cfg('code_attempts', '3')::int then
+          return jsonb_build_object('id', q.id, 'kind', 'code', 'retry', true,
+            'attemptsLeft', kaleido.cfg('code_attempts', '3')::int - v_k);
+        end if;
+      end if;
+      v_points := case when v_ok then q.points else 0 end;
+      v_data := to_jsonb(v_text);
+
+    elsif q.kind = 'sudoku' then
+      if not kaleido.sudoku_ok(b->>'grid', q.data#>>'{puzzle,grid}') then
+        return kaleido.err('NOT_SOLVED', 'В судоку есть ошибки — проверь строки, столбцы и квадраты');
+      end if;
+      v_ok := true; v_points := q.points; v_data := to_jsonb(b->>'grid');
+
+    elsif q.kind = 'paint' then
+      if coalesce(b->'cells', 'null'::jsonb) is distinct from q.data#>'{picture,cells}' then
+        return kaleido.err('NOT_SOLVED', 'Раскраска ещё не закончена');
+      end if;
+      v_ok := true; v_points := q.points;
+
+    else -- open
       if length(coalesce(b->>'text', '')) > 3000 then return kaleido.err('TOO_LONG', 'Ответ слишком длинный: до 3000 символов'); end if;
       select s.points, s.clean, s.text_length into v_points, v_text, v_len from kaleido.score_open(b->>'text', q.points) s;
       if v_text = '' then return kaleido.err('EMPTY_TEXT', 'Напиши хотя бы пару слов'); end if;
@@ -339,26 +638,97 @@ begin
 
     begin
       insert into kaleido.answers (game_id, question_id, position, kind, option_index, is_correct,
-        text_answer, text_length, share_consent, points)
-      values (g.id, q.id, g.answered + 1, q.kind, v_opt, v_ok, v_text, v_len,
-        q.kind = 'open' and coalesce((b->>'share_consent')::boolean, false), v_points);
+        text_answer, text_length, share_consent, points, answer_data)
+      values (g.id, q.id, g.answered + 1, q.kind, v_opt, v_ok,
+        case when q.kind = 'open' then v_text end, v_len,
+        q.kind = 'open' and coalesce((b->>'share_consent')::boolean, false), v_points, v_data);
     exception when unique_violation then
       return kaleido.err('ALREADY_ANSWERED', 'Ответ уже принят');
     end;
 
-    v_answered := g.answered + 1;
-    v_finished := v_answered >= g.total;
-    update kaleido.games set answered = v_answered, score = score + v_points,
+    select count(*) into v_main from kaleido.answers a join kaleido.questions qq on qq.id = a.question_id
+      where a.game_id = g.id and qq.active and qq.block_id is not null and qq.block_id <> 'extras';
+    v_total := kaleido.main_total();
+    update kaleido.games set answered = answered + 1, score = score + v_points, total = v_total,
       correct = correct + case when v_ok then 1 else 0 end,
-      status = case when v_finished then 'finished' else status end,
-      finished_at = case when v_finished then now() else finished_at end
+      status = case when status = 'active' and v_main >= v_total then 'finished' else status end,
+      finished_at = case when status = 'active' and v_main >= v_total then now() else finished_at end
     where id = g.id returning * into g;
 
     return jsonb_strip_nulls(jsonb_build_object(
-      'kind', q.kind, 'isCorrect', v_ok,
+      'id', q.id, 'kind', q.kind, 'isCorrect', v_ok, 'points', v_points, 'maxPoints', q.points,
       'correctOptionIndex', case when q.kind = 'choice' then q.correct_option end,
-      'points', v_points, 'maxPoints', q.points,
-      'score', g.score, 'answered', g.answered, 'finished', g.status = 'finished'));
+      'correctOptions', case when q.kind = 'multi' then q.solution end,
+      'correctMatch', case when q.kind = 'match' then q.solution end,
+      'correctText', case when q.kind = 'code' and not v_ok then q.solution->>0 end,
+      'score', g.score, 'answered', g.answered, 'mainDone', v_main, 'total', v_total,
+      'finished', g.status = 'finished'));
+  end if;
+
+  -- ---------- управление для организаторов ----------
+  if act like 'admin\_%' then
+    if not kaleido.is_admin(p) then return kaleido.err('FORBIDDEN', 'Только для организаторов'); end if;
+    v_block := b->>'block_id';
+    if act in ('admin_open', 'admin_close') and not exists (select 1 from kaleido.blocks where id = v_block and active) then
+      return kaleido.err('BLOCK_NOT_FOUND', 'Блок не найден');
+    end if;
+    if act = 'admin_open' then             -- открыть блок для всех и отметить его идущим сейчас
+      update kaleido.blocks set opened_at = coalesce(opened_at, now()) where id = v_block;
+      perform kaleido.set_cfg('live_mode', 'manual'); perform kaleido.set_cfg('live_block', v_block);
+    elsif act = 'admin_break' then         -- перерыв: открываются дополнительные задания
+      perform kaleido.set_cfg('live_mode', 'manual'); perform kaleido.set_cfg('live_block', '');
+    elsif act = 'admin_auto' then          -- снова по времени программы
+      perform kaleido.set_cfg('live_mode', 'auto'); perform kaleido.set_cfg('live_block', '');
+    elsif act = 'admin_close' then         -- отменить ручное открытие (по времени блок всё равно откроется)
+      update kaleido.blocks set opened_at = null where id = v_block;
+      if kaleido.cfg('live_block') = v_block then perform kaleido.set_cfg('live_block', ''); end if;
+    elsif act = 'admin_draw' then          -- розыгрыш среди всех билетов, купленных с прошлого розыгрыша
+      v_title := left(btrim(coalesce(b->>'title', '')), 120);
+      if coalesce(b->>'prizes', '') !~ '^\d{1,4}$' or (b->>'prizes')::int not between 1 and 1000 then
+        return kaleido.err('BAD_PRIZES', 'Сколько призов: от 1 до 1000');
+      end if;
+      v_prizes := (b->>'prizes')::int;
+      lock table kaleido.tickets in exclusive mode;                 -- покупки подождут окончания розыгрыша
+      if not exists (select 1 from kaleido.tickets where draw_id is null) then
+        return kaleido.err('NO_TICKETS', 'Билетов пока нет — розыгрышу не из чего выбирать');
+      end if;
+      if v_title = '' then v_title := 'Розыгрыш №' || (coalesce((select max(id) from kaleido.draws), 0) + 1); end if;
+      insert into kaleido.draws (title, prizes, created_by) values (v_title, v_prizes, p.id) returning id into v_draw;
+      update kaleido.tickets set draw_id = v_draw where draw_id is null;
+      -- билеты в случайном порядке; у каждого участника в зачёт идёт его «самый удачный» билет,
+      -- побеждают первые v_prizes участников. Больше билетов — больше шансов, но один приз на человека.
+      with k as (select id, player_id, random() as r from kaleido.tickets where draw_id = v_draw),
+           best as (select distinct on (player_id) id, r from k order by player_id, r),
+           win as (select id from best order by r limit v_prizes)
+      update kaleido.tickets set won = true where id in (select id from win);
+      update kaleido.draws set tickets = (select count(*) from kaleido.tickets where draw_id = v_draw),
+        players = (select count(distinct player_id) from kaleido.tickets where draw_id = v_draw) where id = v_draw;
+      return kaleido.state_payload() || jsonb_build_object('ok', true, 'draw', kaleido.draw_admin(v_draw));
+    elsif act = 'admin_draws' then
+      return jsonb_build_object('pending', (select count(*) from kaleido.tickets where draw_id is null),
+        'pendingPlayers', (select count(distinct player_id) from kaleido.tickets where draw_id is null),
+        'draws', (select coalesce(jsonb_agg(kaleido.draw_admin(d.id) order by d.id desc), '[]'::jsonb)
+                  from (select id from kaleido.draws order by id desc limit 30) d));
+    elsif act = 'admin_players' then       -- участники: номер, имя, баллы, билеты; поиск по номеру или имени
+      v_text := btrim(coalesce(b->>'q', ''));
+      return jsonb_build_object('total', (select count(*) from kaleido.players),
+        'players', (select coalesce(jsonb_agg(to_jsonb(r)), '[]'::jsonb) from (
+          select pl.number, pl.name, pl.provider, sc.score, sp.spent, greatest(0, sc.score - sp.spent) as balance,
+            (select count(*) from kaleido.tickets t where t.player_id = pl.id and t.draw_id is null) as pending,
+            (select count(*) from kaleido.tickets t where t.player_id = pl.id and t.won) as wins
+          from kaleido.players pl
+          cross join lateral (select kaleido.player_score(pl.id) as score) sc
+          cross join lateral (select kaleido.player_spent(pl.id) as spent) sp
+          where v_text = '' or pl.number::text = ltrim(v_text, '№ 0')
+             or kaleido.lower_ru(coalesce(pl.name, '')) like '%' || kaleido.lower_ru(v_text) || '%'
+          order by sc.score desc, pl.number limit 100) r));
+    elsif act = 'admin_reset' then         -- после репетиции: всё как в программе
+      update kaleido.blocks set opened_at = null;
+      perform kaleido.set_cfg('live_mode', 'auto'); perform kaleido.set_cfg('live_block', '');
+    else
+      return kaleido.err('UNKNOWN_ACTION', 'Неизвестное действие');
+    end if;
+    return kaleido.state_payload() || jsonb_build_object('ok', true);
   end if;
 
   return kaleido.err('UNKNOWN_ACTION', 'Неизвестное действие');
@@ -762,7 +1132,7 @@ select jsonb_build_object('ok', true, 'step', '004_bot') as result;
 -- Тексты и программа бота. ФАЙЛ СОБИРАЕТСЯ АВТОМАТИЧЕСКИ из data/bot.json (npm run build) — правьте JSON.
 
 insert into kaleido.bot_content (key, value, updated_at)
-values ('content', $bot8ed4d521${"conference":{"name":"Конференция УРСП","date":"2026-12-08","date_text":"8 декабря","timezone":"Asia/Yekaterinburg","timezone_text":"время екатеринбургское"},"texts":{"welcome":"<b>Привет, {name}!</b>\n\nЭто бот конференции УРСП «Год, в котором произошло всё» — {date_text}.\n\nЗдесь программа, что идёт прямо сейчас, напоминания о главных блоках и игра <b>«Калейдоскоп вопросов»</b>: отвечай, прокручивай калейдоскоп и собирай свой узор.\n\nВыбирай раздел на клавиатуре внизу 👇","about":"<b>Год, в котором произошло всё</b>\n\nВ этом году изменений было больше, чем когда-либо. И все они сложились в одну большую картину.\n\nМы все разные и смотрим на неё с разных сторон — как стёклышки в калейдоскопе: по отдельности это кусочки цвета, а вместе — узор.\n\n<b>Что будет</b>\n🎤 Большие кейсы — один результат глазами нескольких ролей\n⚡ Pecha Kucha «Так исторически складывалось» — много коротких историй\n🤫 Секретный доклад\n🪞 Блоки о том, как мы видим себя и как видят нас\n🛠 Мастер-классы\n🏆 Премия «Герои УРСП»\n\n<b>Для онлайна</b> — своя игра внутри конференции: онлайн-бинго и «Калейдоскоп вопросов».","howto":"<b>Как играть в «Калейдоскоп вопросов»</b>\n\n1️⃣ Отвечай на вопрос — за верный ответ 10 ★\n2️⃣ Прокрути калейдоскоп пальцем — новый кристалл встанет на место, узор станет ярче\n3️⃣ В открытых вопросах пиши развёрнуто: чем подробнее, тем больше баллов, до 20 ★\n4️⃣ На финале — твой собственный узор, его можно сохранить картинкой\n\nПрогресс сохраняется: можно закрыть и продолжить позже.","help":"<b>Помощь</b>\n\nКнопки внизу — главное меню. Если клавиатура пропала, отправь /menu.\n\n/program — программа\n/now — что идёт сейчас\n/score — мой счёт в игре\n/stop — отключить напоминания, /notify — включить снова\n\nВопросы по конференции — организаторам: [черновик: контакт уточняется].","fallback":"Я пока не умею отвечать на сообщения 🙂\nВыбери раздел на клавиатуре внизу или отправь /menu.","score_none":"Ты ещё не начинал игру.\nНажми «🎮 Играть» — первый кристалл ждёт.","score_link":"Счёт, прогресс и место среди участников — в самой игре.\nНажми «🎮 Открыть игру».","stop":"Напоминания выключены. Включить снова — /notify.","notify":"Напоминания включены 🔔 Пришлю, когда начнутся главные блоки.","before":"До конференции — <b>{days}</b>.\nНачинаем {date_text} в {first_time} ({timezone_text}).","after":"Конференция завершилась. Спасибо, что были с нами! ✨\nКартина года сложилась — а калейдоскоп можно доиграть.","rated":"Спасибо! Твоя оценка: {stars}","reminder":"⏰ Через {minutes} минут: <b>{title}</b>"},"parts":[{"title":"Утро","from":1,"to":7},{"title":"До обеда","from":8,"to":14},{"title":"После обеда","from":15,"to":18},{"title":"Мастер-классы и финал","from":19,"to":25}],"program":[{"time":"10:00–10:06","icon":"🎬","title":"Видеооткрытие «Год, в котором произошло всё»","note":"Весь год — один большой калейдоскоп","notify":true},{"time":"10:06–10:09","icon":"🎙","title":"Ведущий: приветствие, бинго и игра"},{"time":"10:09–10:29","icon":"🎤","title":"Открытие. Лилия — «Картина целиком»","note":"Почему система менялась, какой эффект получили и куда идём"},{"time":"10:29–10:46","icon":"⚡","title":"Pecha Kucha «Так исторически складывалось»: ИИ-трансформация","note":"Много маленьких историй — одна большая картина"},{"time":"10:46–10:48","icon":"🎙","title":"Ведущий: новый формат докладов"},{"time":"10:48–11:08","icon":"🎤","title":"Большой кейс №1: «Свободная касса»","note":"Один результат глазами нескольких ролей","notify":true},{"time":"11:08–11:25","icon":"⚡","title":"Pecha Kucha «Так исторически складывалось»: УРР"},{"time":"11:25–11:55","icon":"☕","title":"Перерыв · онлайн-бинго · нетворкинг","note":"Первые итоги бинго для онлайна, общение — для зала","notify":true},{"time":"11:55–12:15","icon":"🎤","title":"Большой кейс №2: «ИИ-продавец»","notify":true},{"time":"12:15–12:32","icon":"⚡","title":"Pecha Kucha «Так исторически складывалось»: СКПП"},{"time":"12:32–12:34","icon":"🎙","title":"Ведущий"},{"time":"12:34–12:55","icon":"🤫","title":"Секретный доклад","note":"Взгляд с высоты всей системы продаж","notify":true},{"time":"12:55–13:10","icon":"🎲","title":"Онлайн-бинго: новые итоги и анонсы"},{"time":"13:10–14:00","icon":"🍽","title":"Обед","note":"В перерыве — номинанты премии «Герои УРСП»"},{"time":"14:00–14:25","icon":"🪞","title":"Тёплый блок «А что мы сами о себе думаем?»","notify":true},{"time":"14:25–14:50","icon":"🔥","title":"Острый блок: «Что думают о нас» и «Как я сломал систему»"},{"time":"14:50–15:15","icon":"🧩","title":"Блок про устойчивость [черновик: тема уточняется]"},{"time":"15:15–15:30","icon":"☕","title":"Перерыв · онлайн-бинго · нетворкинг"},{"time":"15:30–17:00","icon":"🛠","title":"Мастер-классы","notify":true},{"time":"17:00–17:20","icon":"☕","title":"Возвращение в зал"},{"time":"17:20–17:30","icon":"🎲","title":"Онлайн-бинго: награждение победителей","notify":true},{"time":"17:30–17:35","icon":"🎬","title":"Видео «Герои УРСП»"},{"time":"17:35–18:00","icon":"🏆","title":"Премия «Герои УРСП»","note":"Люди, которые создавали картину года","notify":true},{"time":"18:00–18:05","icon":"✨","title":"Финал","note":"Отойти назад и увидеть общую картину"},{"time":"18:05–20:00","icon":"🎉","title":"Неформальная часть [черновик: программа уточняется]"}]}$bot8ed4d521$::jsonb, now())
+values ('content', $bot7f8f4176${"conference":{"name":"Конференция УРСП","date":"2026-12-08","date_text":"8 декабря","timezone":"Asia/Yekaterinburg","timezone_text":"время екатеринбургское"},"texts":{"welcome":"<b>Привет, {name}!</b>\n\nЭто бот конференции УРСП «Год, в котором произошло всё» — {date_text}.\n\nЗдесь программа, что идёт прямо сейчас, напоминания о главных блоках и игра <b>«Калейдоскоп вопросов»</b>: отвечай на задания, собирай свой витраж и меняй баллы на билеты в розыгрыше призов.\n\nВыбирай раздел на клавиатуре внизу 👇","about":"<b>Год, в котором произошло всё</b>\n\nВ этом году изменений было больше, чем когда-либо. И все они сложились в одну большую картину.\n\nМы все разные и смотрим на неё с разных сторон — как стёклышки в калейдоскопе: по отдельности это кусочки цвета, а вместе — узор.\n\n<b>Что будет</b>\n🎤 Большие кейсы — один результат глазами нескольких ролей\n⚡ Pecha Kucha «Так исторически складывалось» — много коротких историй\n🤫 Секретный доклад\n🪞 Блоки о том, как мы видим себя и как видят нас\n🛠 Мастер-классы\n🏆 Премия «Герои УРСП»\n\n<b>Для онлайна</b> — своя игра внутри конференции: онлайн-бинго и «Калейдоскоп вопросов».","howto":"<b>Как играть в «Калейдоскоп вопросов»</b>\n\n1️⃣ Задания открываются по ходу программы — свой блок на каждый доклад\n2️⃣ Ответил — прокрути калейдоскоп: новое стёклышко встанет в твой витраж\n3️⃣ В перерывах — «Как ещё заработать баллы»: вопросы, судоку, раскраски\n4️⃣ Баллы меняй на билеты: 1 билет — 30 ★. Розыгрыши призов — в перерывах\n\nКаждому участнику — свой номер: по нему объявляют победителей. Номер виден в игре вверху экрана.","help":"<b>Помощь</b>\n\nКнопки внизу — главное меню. Если клавиатура пропала, отправь /menu.\n\n/program — программа\n/now — что идёт сейчас\n/score — мой счёт в игре\n/stop — отключить напоминания, /notify — включить снова\n\nВопросы по конференции — организаторам: [черновик: контакт уточняется].","fallback":"Я пока не умею отвечать на сообщения 🙂\nВыбери раздел на клавиатуре внизу или отправь /menu.","score_none":"Ты ещё не начинал игру.\nНажми «🎮 Играть» — первый кристалл ждёт.","score_link":"Твой номер участника, баллы и билеты на розыгрыши — в самой игре.\nНажми «🎮 Открыть игру».","stop":"Напоминания выключены. Включить снова — /notify.","notify":"Напоминания включены 🔔 Пришлю, когда начнутся главные блоки.","before":"До конференции — <b>{days}</b>.\nНачинаем {date_text} в {first_time} ({timezone_text}).","after":"Конференция завершилась. Спасибо, что были с нами! ✨\nКартина года сложилась — а калейдоскоп можно доиграть.","rated":"Спасибо! Твоя оценка: {stars}","reminder":"⏰ Через {minutes} минут: <b>{title}</b>"},"parts":[{"title":"Утро","from":1,"to":7},{"title":"До обеда","from":8,"to":14},{"title":"После обеда","from":15,"to":18},{"title":"Мастер-классы и финал","from":19,"to":25}],"program":[{"time":"10:00–10:06","icon":"🎬","title":"Видеооткрытие «Год, в котором произошло всё»","note":"Весь год — один большой калейдоскоп","notify":true},{"time":"10:06–10:09","icon":"🎙","title":"Ведущий: приветствие, бинго и игра"},{"time":"10:09–10:29","icon":"🎤","title":"Открытие. Лилия — «Картина целиком»","note":"Почему система менялась, какой эффект получили и куда идём"},{"time":"10:29–10:46","icon":"⚡","title":"Pecha Kucha «Так исторически складывалось»: ИИ-трансформация","note":"Много маленьких историй — одна большая картина"},{"time":"10:46–10:48","icon":"🎙","title":"Ведущий: новый формат докладов"},{"time":"10:48–11:08","icon":"🎤","title":"Большой кейс №1: «Свободная касса»","note":"Один результат глазами нескольких ролей","notify":true},{"time":"11:08–11:25","icon":"⚡","title":"Pecha Kucha «Так исторически складывалось»: УРР"},{"time":"11:25–11:55","icon":"☕","title":"Перерыв · онлайн-бинго · нетворкинг","note":"Первые итоги бинго для онлайна, общение — для зала","notify":true},{"time":"11:55–12:15","icon":"🎤","title":"Большой кейс №2: «ИИ-продавец»","notify":true},{"time":"12:15–12:32","icon":"⚡","title":"Pecha Kucha «Так исторически складывалось»: СКПП"},{"time":"12:32–12:34","icon":"🎙","title":"Ведущий"},{"time":"12:34–12:55","icon":"🤫","title":"Секретный доклад","note":"Взгляд с высоты всей системы продаж","notify":true},{"time":"12:55–13:10","icon":"🎲","title":"Онлайн-бинго: новые итоги и анонсы"},{"time":"13:10–14:00","icon":"🍽","title":"Обед","note":"В перерыве — номинанты премии «Герои УРСП»"},{"time":"14:00–14:25","icon":"🪞","title":"Тёплый блок «А что мы сами о себе думаем?»","notify":true},{"time":"14:25–14:50","icon":"🔥","title":"Острый блок: «Что думают о нас» и «Как я сломал систему»"},{"time":"14:50–15:15","icon":"🧩","title":"Блок про устойчивость [черновик: тема уточняется]"},{"time":"15:15–15:30","icon":"☕","title":"Перерыв · онлайн-бинго · нетворкинг"},{"time":"15:30–17:00","icon":"🛠","title":"Мастер-классы","notify":true},{"time":"17:00–17:20","icon":"☕","title":"Возвращение в зал"},{"time":"17:20–17:30","icon":"🎲","title":"Онлайн-бинго: награждение победителей","notify":true},{"time":"17:30–17:35","icon":"🎬","title":"Видео «Герои УРСП»"},{"time":"17:35–18:00","icon":"🏆","title":"Премия «Герои УРСП»","note":"Люди, которые создавали картину года","notify":true},{"time":"18:00–18:05","icon":"✨","title":"Финал","note":"Отойти назад и увидеть общую картину"},{"time":"18:05–20:00","icon":"🎉","title":"Неформальная часть [черновик: программа уточняется]"}]}$bot7f8f4176$::jsonb, now())
 on conflict (key) do update set value = excluded.value, updated_at = now();
 
 select jsonb_build_object('ok', true, 'step', '005_bot_content', 'program', jsonb_array_length(kaleido.bot_c()->'program')) as result;
